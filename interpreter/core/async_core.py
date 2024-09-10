@@ -12,8 +12,11 @@ from typing import Any, Dict, List, Optional, Union
 
 import shortuuid
 from pydantic import BaseModel
+from starlette.websockets import WebSocketState
 
 from .core import OpenInterpreter
+
+last_start_time = 0
 
 try:
     import janus
@@ -55,6 +58,9 @@ class AsyncInterpreter(OpenInterpreter):
         self.acknowledged_outputs = []
 
         self.server = Server(self)
+
+        # For the 01. This lets the OAI compatible server accumulate context before responding.
+        self.context_mode = False
 
     async def input(self, chunk):
         """
@@ -102,58 +108,103 @@ class AsyncInterpreter(OpenInterpreter):
         return await self.output_queue.async_q.get()
 
     def respond(self, run_code=None):
-        try:
-            if run_code == None:
-                run_code = self.auto_run
+        for attempt in range(5):  # 5 attempts
+            try:
+                if run_code == None:
+                    run_code = self.auto_run
 
-            for chunk_og in self._respond_and_store():
-                chunk = (
-                    chunk_og.copy()
-                )  # This fixes weird double token chunks. Probably a deeper problem?
+                sent_chunks = False
 
-                if chunk["type"] == "confirmation":
-                    if run_code:
-                        run_code = False
-                        continue
-                    else:
-                        break
+                for chunk_og in self._respond_and_store():
+                    chunk = (
+                        chunk_og.copy()
+                    )  # This fixes weird double token chunks. Probably a deeper problem?
 
-                if self.stop_event.is_set():
+                    if chunk["type"] == "confirmation":
+                        if run_code:
+                            run_code = False
+                            continue
+                        else:
+                            break
+
+                    if self.stop_event.is_set():
+                        return
+
+                    if self.print:
+                        if "start" in chunk:
+                            print("\n")
+                        if chunk["type"] in ["code", "console"] and "format" in chunk:
+                            if "start" in chunk:
+                                print(
+                                    "\n------------\n\n```" + chunk["format"],
+                                    flush=True,
+                                )
+                            if "end" in chunk:
+                                print("\n```\n\n------------\n\n", flush=True)
+                        if chunk.get("format") != "active_line":
+                            if "format" in chunk and "base64" in chunk["format"]:
+                                print("\n[An image was produced]")
+                            else:
+                                content = chunk.get("content", "")
+                                content = (
+                                    str(content)
+                                    .encode("ascii", "ignore")
+                                    .decode("ascii")
+                                )
+                                print(content, end="", flush=True)
+
+                    if self.debug:
+                        print("Interpreter produced this chunk:", chunk)
+
+                    self.output_queue.sync_q.put(chunk)
+                    sent_chunks = True
+
+                if not sent_chunks:
+                    print("ERROR. NO CHUNKS SENT. TRYING AGAIN.")
+                    print("Messages:", self.messages)
+                    messages = [
+                        "Hello? Answer please.",
+                        "Just say something, anything.",
+                        "Are you there?",
+                        "Can you respond?",
+                        "Please reply.",
+                    ]
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "type": "message",
+                            "content": messages[attempt % len(messages)],
+                        }
+                    )
+                    time.sleep(1)
+                else:
+                    self.output_queue.sync_q.put(complete_message)
+                    if self.debug:
+                        print("\nServer response complete.\n")
                     return
 
-                if self.print or self.debug:
-                    if "start" in chunk:
-                        print("\n")
-                    if chunk["type"] in ["code", "console"] and "format" in chunk:
-                        if "start" in chunk:
-                            print("\n------------\n\n```" + chunk["format"], flush=True)
-                        if "end" in chunk:
-                            print("\n```\n\n------------\n\n", flush=True)
-                    if chunk.get("format") != "active_line":
-                        if "format" in chunk and "base64" in chunk["format"]:
-                            print("\n[An image was produced]")
-                        else:
-                            content = chunk.get("content", "")
-                            content = (
-                                str(content).encode("ascii", "ignore").decode("ascii")
-                            )
-                            print(content, end="", flush=True)
+            except Exception as e:
+                error = traceback.format_exc() + "\n" + str(e)
+                error_message = {
+                    "role": "server",
+                    "type": "error",
+                    "content": traceback.format_exc() + "\n" + str(e),
+                }
+                self.output_queue.sync_q.put(error_message)
+                self.output_queue.sync_q.put(complete_message)
+                print("\n\n--- SENT ERROR: ---\n\n")
+                print(error)
+                print("\n\n--- (ERROR ABOVE WAS SENT) ---\n\n")
+                return
 
-                self.output_queue.sync_q.put(chunk)
-
-            self.output_queue.sync_q.put(complete_message)
-        except Exception as e:
-            error = traceback.format_exc() + "\n" + str(e)
-            error_message = {
-                "role": "server",
-                "type": "error",
-                "content": traceback.format_exc() + "\n" + str(e),
-            }
-            self.output_queue.sync_q.put(error_message)
-            self.output_queue.sync_q.put(complete_message)
-            print("\n\n--- SENT ERROR: ---\n\n")
-            print(error)
-            print("\n\n--- (ERROR ABOVE WAS SENT) ---\n\n")
+        error_message = {
+            "role": "server",
+            "type": "error",
+            "content": "No chunks sent or unknown error.",
+        }
+        self.output_queue.sync_q.put(error_message)
+        self.output_queue.sync_q.put(complete_message)
+        raise Exception("No chunks sent or unknown error.")
 
     def accumulate(self, chunk):
         """
@@ -387,15 +438,20 @@ def create_router(async_interpreter):
     async def websocket_endpoint(websocket: WebSocket):
         await websocket.accept()
 
-        try:
+        try:  # solving it ;)/ # killian super wrote this
 
             async def receive_input():
                 authenticated = False
                 while True:
                     try:
+                        if websocket.client_state != WebSocketState.CONNECTED:
+                            return
                         data = await websocket.receive()
 
-                        if not authenticated:
+                        if (
+                            not authenticated
+                            and os.getenv("INTERPRETER_REQUIRE_AUTH") != "False"
+                        ):
                             if "text" in data:
                                 data = json.loads(data["text"])
                                 if "auth" in data:
@@ -425,7 +481,7 @@ def create_router(async_interpreter):
                                 data = data["bytes"]
                             await async_interpreter.input(data)
                         elif data.get("type") == "websocket.disconnect":
-                            print("Disconnecting.")
+                            print("Client wants to disconnect, that's fine..")
                             return
                         else:
                             print("Invalid data:", data)
@@ -438,29 +494,42 @@ def create_router(async_interpreter):
                             "type": "error",
                             "content": traceback.format_exc() + "\n" + str(e),
                         }
-                        await websocket.send_text(json.dumps(error_message))
-                        await websocket.send_text(json.dumps(complete_message))
-                        print("\n\n--- SENT ERROR: ---\n\n")
+                        if websocket.client_state == WebSocketState.CONNECTED:
+                            await websocket.send_text(json.dumps(error_message))
+                            await websocket.send_text(json.dumps(complete_message))
+                            print("\n\n--- SENT ERROR: ---\n\n")
+                        else:
+                            print(
+                                "\n\n--- ERROR (not sent due to disconnected state): ---\n\n"
+                            )
                         print(error)
-                        print("\n\n--- (ERROR ABOVE WAS SENT) ---\n\n")
+                        print("\n\n--- (ERROR ABOVE) ---\n\n")
 
             async def send_output():
                 while True:
+                    if websocket.client_state != WebSocketState.CONNECTED:
+                        return
                     try:
                         # First, try to send any unsent messages
                         while async_interpreter.unsent_messages:
                             output = async_interpreter.unsent_messages[0]
-                            try:
-                                await send_message(output)
+                            if async_interpreter.debug:
+                                print("This was unsent, sending it again:", output)
+
+                            success = await send_message(output)
+                            if success:
                                 async_interpreter.unsent_messages.popleft()
-                            except Exception:
-                                # If we can't send, break and try again later
-                                break
 
                         # If we've sent all unsent messages, get a new output
                         if not async_interpreter.unsent_messages:
                             output = await async_interpreter.output()
-                            await send_message(output)
+                            success = await send_message(output)
+                            if not success:
+                                async_interpreter.unsent_messages.append(output)
+                                if async_interpreter.debug:
+                                    print(
+                                        f"Added message to unsent_messages queue after failed attempts: {output}"
+                                    )
 
                     except Exception as e:
                         error = traceback.format_exc() + "\n" + str(e)
@@ -488,45 +557,63 @@ def create_router(async_interpreter):
                     ):
                         output["id"] = id
 
-                for attempt in range(100):
-                    if websocket.client_state == 3:  # 3 represents 'CLOSED' state
-                        break
+                for attempt in range(20):
+                    # time.sleep(0.5)
+
+                    if websocket.client_state != WebSocketState.CONNECTED:
+                        return False
+
                     try:
+                        # print("sending:", output)
+
                         if isinstance(output, bytes):
                             await websocket.send_bytes(output)
+                            return True  # Haven't set up ack for this
                         else:
                             if async_interpreter.require_acknowledge:
                                 output["id"] = id
+                            if async_interpreter.debug:
+                                print("Sending this over the websocket:", output)
                             await websocket.send_text(json.dumps(output))
 
                         if async_interpreter.require_acknowledge:
                             acknowledged = False
-                            for _ in range(1000):
+                            for _ in range(100):
                                 if id in async_interpreter.acknowledged_outputs:
                                     async_interpreter.acknowledged_outputs.remove(id)
                                     acknowledged = True
+                                    if async_interpreter.debug:
+                                        print("This output was acknowledged:", output)
                                     break
                                 await asyncio.sleep(0.0001)
 
                             if acknowledged:
-                                return
+                                return True
                             else:
-                                raise Exception("Acknowledgement not received.")
+                                if async_interpreter.debug:
+                                    print("Acknowledgement not received for:", output)
+                                return False
                         else:
-                            return
+                            return True
 
                     except Exception as e:
                         print(
                             f"Failed to send output on attempt number: {attempt + 1}. Output was: {output}"
                         )
                         print(f"Error: {str(e)}")
-                        await asyncio.sleep(0.05)
+                        traceback.print_exc()
+                        await asyncio.sleep(0.01)
 
                 # If we've reached this point, we've failed to send after 100 attempts
-                async_interpreter.unsent_messages.append(output)
-                print(
-                    f"Added message to unsent_messages queue after failed attempts: {output}"
-                )
+                if output not in async_interpreter.unsent_messages:
+                    print("Failed to send message:", output)
+                else:
+                    print(
+                        "Failed to send message, also it was already in unsent queue???:",
+                        output,
+                    )
+
+                return False
 
             await asyncio.gather(receive_input(), send_output())
 
@@ -555,7 +642,8 @@ def create_router(async_interpreter):
     @router.post("/settings")
     async def set_settings(payload: Dict[str, Any]):
         for key, value in payload.items():
-            print(f"Updating settings: {key} = {value}")
+            print("Updating settings...")
+            # print(f"Updating settings: {key} = {value}")
             if key in ["llm", "computer"] and isinstance(value, dict):
                 if key == "auto_run":
                     return {
@@ -636,77 +724,141 @@ def create_router(async_interpreter):
         stream: Optional[bool] = False
 
     async def openai_compatible_generator():
-        for i, chunk in enumerate(async_interpreter._respond_and_store()):
-            output_content = None
+        made_chunk = False
 
-            if chunk["type"] == "message" and "content" in chunk:
-                output_content = chunk["content"]
-            if chunk["type"] == "code" and "start" in chunk:
-                output_content = " "
+        for message in [
+            ".",
+            "Just say something, anything.",
+            "Hello? Answer please.",
+            "Are you there?",
+            "Can you respond?",
+            "Please reply.",
+        ]:
+            for i, chunk in enumerate(
+                async_interpreter.chat(message=message, stream=True, display=True)
+            ):
+                made_chunk = True
 
-            if output_content:
-                await asyncio.sleep(0)
-                output_chunk = {
-                    "id": i,
-                    "object": "chat.completion.chunk",
-                    "created": time.time(),
-                    "model": "open-interpreter",
-                    "choices": [{"delta": {"content": output_content}}],
-                }
-                yield f"data: {json.dumps(output_chunk)}\n\n"
+                if async_interpreter.stop_event.is_set():
+                    break
+
+                output_content = None
+
+                if chunk["type"] == "message" and "content" in chunk:
+                    output_content = chunk["content"]
+                if chunk["type"] == "code" and "start" in chunk:
+                    output_content = " "
+
+                if output_content:
+                    await asyncio.sleep(0)
+                    output_chunk = {
+                        "id": i,
+                        "object": "chat.completion.chunk",
+                        "created": time.time(),
+                        "model": "open-interpreter",
+                        "choices": [{"delta": {"content": output_content}}],
+                    }
+                    yield f"data: {json.dumps(output_chunk)}\n\n"
+
+            if made_chunk:
+                break
 
     @router.post("/openai/chat/completions")
     async def chat_completion(request: ChatCompletionRequest):
+        global last_start_time
+
         # Convert to LMC
+        last_message = request.messages[-1]
 
-        user_messages = []
-        for message in reversed(request.messages):
-            if message.role == "user":
-                user_messages.append(message)
+        if last_message.role != "user":
+            raise ValueError("Last message must be from the user.")
+
+        if last_message.content == "{STOP}":
+            # Handle special STOP token
+            return
+
+        if last_message.content in ["{CONTEXT_MODE_ON}", "{REQUIRE_START_ON}"]:
+            async_interpreter.context_mode = True
+            return
+
+        if last_message.content in ["{CONTEXT_MODE_OFF}", "{REQUIRE_START_OFF}"]:
+            async_interpreter.context_mode = False
+            return
+
+        if type(last_message.content) == str:
+            async_interpreter.messages.append(
+                {
+                    "role": "user",
+                    "type": "message",
+                    "content": last_message.content,
+                }
+            )
+            print(">", last_message.content)
+        elif type(last_message.content) == list:
+            for content in last_message.content:
+                if content["type"] == "text":
+                    async_interpreter.messages.append(
+                        {"role": "user", "type": "message", "content": str(content)}
+                    )
+                    print(">", content)
+                elif content["type"] == "image_url":
+                    if "url" not in content["image_url"]:
+                        raise Exception("`url` must be in `image_url`.")
+                    url = content["image_url"]["url"]
+                    print("> [user sent an image]", url[:100])
+                    if "base64," not in url:
+                        raise Exception(
+                            '''Image must be in the format: "data:image/jpeg;base64,{base64_image}"'''
+                        )
+
+                    # data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA6oA...
+
+                    data = url.split("base64,")[1]
+                    format = "base64." + url.split(";")[0].split("/")[1]
+                    async_interpreter.messages.append(
+                        {
+                            "role": "user",
+                            "type": "image",
+                            "format": format,
+                            "content": data,
+                        }
+                    )
+
+        if async_interpreter.context_mode:
+            # In context mode, we only respond if we recieved a {START} message
+            # Otherwise, we're just accumulating context
+            if last_message.content == "{START}":
+                if async_interpreter.messages[-1]["content"] == "{START}":
+                    # Remove that {START} message that would have just been added
+                    async_interpreter.messages = async_interpreter.messages[:-1]
+                last_start_time = time.time()
             else:
-                break
-        user_messages.reverse()
+                # Check if we're within 6 seconds of last_start_time
+                current_time = time.time()
+                if current_time - last_start_time <= 6:
+                    # Continue processing
+                    pass
+                else:
+                    # More than 6 seconds have passed, so return
+                    return
 
-        for message in user_messages:
-            if type(message.content) == str:
-                async_interpreter.messages.append(
-                    {"role": "user", "type": "message", "content": message.content}
-                )
-            if type(message.content) == list:
-                for content in message.content:
-                    if content["type"] == "text":
-                        async_interpreter.messages.append(
-                            {"role": "user", "type": "message", "content": content}
-                        )
-                    elif content["type"] == "image_url":
-                        if "url" not in content["image_url"]:
-                            raise Exception("`url` must be in `image_url`.")
-                        url = content["image_url"]["url"]
-                        print(url[:100])
-                        if "base64," not in url:
-                            raise Exception(
-                                '''Image must be in the format: "data:image/jpeg;base64,{base64_image}"'''
-                            )
+        else:
+            if last_message.content == "{START}":
+                # This just sometimes happens I guess
+                # Remove that {START} message that would have just been added
+                async_interpreter.messages = async_interpreter.messages[:-1]
+                return
 
-                        # data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA6oA...
-
-                        data = url.split("base64,")[1]
-                        format = "base64." + url.split(";")[0].split("/")[1]
-                        async_interpreter.messages.append(
-                            {
-                                "role": "user",
-                                "type": "image",
-                                "format": format,
-                                "content": data,
-                            }
-                        )
+        async_interpreter.stop_event.set()
+        time.sleep(0.1)
+        async_interpreter.stop_event.clear()
 
         if request.stream:
             return StreamingResponse(
                 openai_compatible_generator(), media_type="application/x-ndjson"
             )
         else:
-            messages = async_interpreter.chat(message="", stream=False, display=True)
+            messages = async_interpreter.chat(message=".", stream=False, display=True)
             content = messages[-1]["content"]
             return {
                 "id": "200",
@@ -731,6 +883,10 @@ class Server:
         # Add authentication middleware
         @self.app.middleware("http")
         async def validate_api_key(request: Request, call_next):
+            # Ignore authentication for the /heartbeat route
+            if request.url.path == "/heartbeat":
+                return await call_next(request)
+
             api_key = request.headers.get("X-API-KEY")
             if self.authenticate(api_key):
                 response = await call_next(request)

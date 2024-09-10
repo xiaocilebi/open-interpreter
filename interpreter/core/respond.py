@@ -7,7 +7,6 @@ import traceback
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 import litellm
 
-from ..terminal_interface.utils.display_markdown_message import display_markdown_message
 from .render_message import render_message
 
 
@@ -88,7 +87,7 @@ def respond(interpreter):
                     yield {"role": "assistant", **chunk}
 
             except litellm.exceptions.BudgetExceededError:
-                display_markdown_message(
+                interpreter.display_message(
                     f"""> Max budget exceeded
 
                     **Session spend:** ${litellm._current_cost}
@@ -136,8 +135,8 @@ def respond(interpreter):
 
                     if response.strip().lower() == "y":
                         interpreter.llm.model = "i"
-                        display_markdown_message(f"> Model set to `i`")
-                        display_markdown_message(
+                        interpreter.display_message(f"> Model set to `i`")
+                        interpreter.display_message(
                             "***Note:*** *Conversations with this model will be used to train our open-source model.*\n"
                         )
 
@@ -178,6 +177,19 @@ def respond(interpreter):
                         interpreter.messages[-1][
                             "format"
                         ] = language  # So the LLM can see it.
+                    except:
+                        pass
+
+                # print(code)
+                # print("---")
+                # time.sleep(2)
+
+                if code.strip().endswith("executeexecute"):
+                    code = code.replace("executeexecute", "")
+                    try:
+                        interpreter.messages[-1][
+                            "content"
+                        ] = code  # So the LLM can see it.
                     except:
                         pass
 
@@ -247,6 +259,16 @@ def respond(interpreter):
                     else:
                         break
 
+                # Is there any code at all?
+                if code.strip() == "":
+                    yield {
+                        "role": "computer",
+                        "type": "console",
+                        "format": "output",
+                        "content": "Code block was empty. Please try again, be sure to write code before executing.",
+                    }
+                    continue
+
                 # Yield a message, such that the user can stop code execution if they want to
                 try:
                     yield {
@@ -286,12 +308,14 @@ def respond(interpreter):
                     code = re.sub(r"import computer\.\w+\n", "pass\n", code)
                     # If it does this it sees the screenshot twice (which is expected jupyter behavior)
                     if any(
-                        code.strip().split("\n")[-1].startswith(text)
-                        for text in [
-                            "computer.display.view",
-                            "computer.display.screenshot",
-                            "computer.view",
-                            "computer.screenshot",
+                        [
+                            code.strip().split("\n")[-1].startswith(text)
+                            for text in [
+                                "computer.display.view",
+                                "computer.display.screenshot",
+                                "computer.view",
+                                "computer.screenshot",
+                            ]
                         ]
                     ):
                         code = code + "\npass"

@@ -1,10 +1,15 @@
 import os
 
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+import sys
+
 import litellm
 
 litellm.suppress_debug_info = True
+litellm.REPEATED_STREAMING_CHUNK_LIMIT = 99999999
+
 import json
+import logging
 import subprocess
 import time
 import uuid
@@ -12,14 +17,22 @@ import uuid
 import requests
 import tokentrim as tt
 
-from ...terminal_interface.utils.display_markdown_message import (
-    display_markdown_message,
-)
 from .run_text_llm import run_text_llm
 
 # from .run_function_calling_llm import run_function_calling_llm
 from .run_tool_calling_llm import run_tool_calling_llm
 from .utils.convert_to_openai_messages import convert_to_openai_messages
+
+# Create or get the logger
+logger = logging.getLogger("LiteLLM")
+
+
+class SuppressDebugFilter(logging.Filter):
+    def filter(self, record):
+        # Suppress only the specific message containing the keywords
+        if "cost map" in record.getMessage():
+            return False  # Suppress this log message
+        return True  # Allow all other messages
 
 
 class Llm:
@@ -28,6 +41,9 @@ class Llm:
     """
 
     def __init__(self, interpreter):
+        # Add the filter to the logger
+        logger.addFilter(SuppressDebugFilter())
+
         # Store a reference to parent interpreter
         self.interpreter = interpreter
 
@@ -35,7 +51,7 @@ class Llm:
         self.completions = fixed_litellm_completions
 
         # Settings
-        self.model = "gpt-4-turbo"
+        self.model = "gpt-4o"
         self.temperature = 0
 
         self.supports_vision = None  # Will try to auto-detect
@@ -89,6 +105,14 @@ class Llm:
             ), "No message after the first can have the role 'system'"
 
         model = self.model
+        if model in [
+            "claude-3.5",
+            "claude-3-5",
+            "claude-3.5-sonnet",
+            "claude-3-5-sonnet",
+        ]:
+            model = "claude-3-5-sonnet-20240620"
+            self.model = "claude-3-5-sonnet-20240620"
         # Setup our model endpoint
         if model == "i":
             model = "openai/i"
@@ -213,7 +237,7 @@ class Llm:
                 except:
                     if len(messages) == 1:
                         if self.interpreter.in_terminal_interface:
-                            display_markdown_message(
+                            self.interpreter.display_message(
                                 """
 **We were unable to determine the context window of this model.** Defaulting to 8000.
 
@@ -223,7 +247,7 @@ Continuing...
                             """
                             )
                         else:
-                            display_markdown_message(
+                            self.interpreter.display_message(
                                 """
 **We were unable to determine the context window of this model.** Defaulting to 8000.
 
@@ -246,6 +270,12 @@ Continuing...
             messages = [{"role": "system", "content": system_message}] + messages
 
             pass
+
+        # If there should be a system message, there should be a system message!
+        # Empty system messages appear to be deleted :(
+        if system_message == "":
+            if messages[0]["role"] != "system":
+                messages = [{"role": "system", "content": system_message}] + messages
 
         ## Start forming the request
 
@@ -275,8 +305,10 @@ Continuing...
         if self.interpreter.verbose:
             litellm.set_verbose = True
 
-        if self.interpreter.debug:
-            print("\n\n\nOPENAI COMPATIBLE MESSAGES\n\n\n")
+        if (
+            self.interpreter.debug == True and False  # DISABLED
+        ):  # debug will equal "server" if we're debugging the server specifically
+            print("\n\n\nOPENAI COMPATIBLE MESSAGES:\n\n\n")
             for message in messages:
                 if len(str(message)) > 5000:
                     print(str(message)[:200] + "...")
@@ -284,7 +316,6 @@ Continuing...
                     print(message)
                 print("\n")
             print("\n\n\n")
-            time.sleep(5)
 
         if self.supports_functions:
             # yield from run_function_calling_llm(self, params)
@@ -306,11 +337,16 @@ Continuing...
         if self._is_loaded:
             return
 
+        if self.model.startswith("ollama/") and not ":" in self.model:
+            self.model = self.model + ":latest"
+
         self._is_loaded = True
 
         if self.model.startswith("ollama/"):
             model_name = self.model.replace("ollama/", "")
-            api_base = getattr(self, 'api_base', None) or "http://localhost:11434"
+            api_base = getattr(self, "api_base", None) or os.getenv(
+                "OLLAMA_HOST", "http://localhost:11434"
+            )
             names = []
             try:
                 # List out all downloaded ollama models. Will fail if ollama isn't installed
@@ -318,9 +354,9 @@ Continuing...
                 if response.ok:
                     data = response.json()
                     names = [
-                        model['name'].replace(":latest", "")
-                        for model in data['models']
-                        if 'name' in model and model['name']
+                        model["name"]
+                        for model in data["models"]
+                        if "name" in model and model["name"]
                     ]
 
             except Exception as e:
@@ -337,7 +373,9 @@ Continuing...
 
             # Get context window if not set
             if self.context_window == None:
-                response = requests.post(f"{api_base}/api/show", json={"name": model_name})
+                response = requests.post(
+                    f"{api_base}/api/show", json={"name": model_name}
+                )
                 model_info = response.json().get("model_info", {})
                 context_length = None
                 for key in model_info:
@@ -351,6 +389,7 @@ Continuing...
                     self.max_tokens = int(self.context_window * 0.2)
 
             # Send a ping, which will actually load the model
+            model_name = model_name.replace(":latest", "")
             print(f"Loading {model_name}...\n")
 
             old_max_tokens = self.max_tokens
@@ -391,14 +430,21 @@ def fixed_litellm_completions(**params):
     else:
         litellm.drop_params = True
 
+    params["model"] = params["model"].replace(":latest", "")
+
     # Run completion
     attempts = 4
     first_error = None
+
+    params["num_retries"] = 0
 
     for attempt in range(attempts):
         try:
             yield from litellm.completion(**params)
             return  # If the completion is successful, exit the function
+        except KeyboardInterrupt:
+            print("Exiting...")
+            sys.exit(0)
         except Exception as e:
             if attempt == 0:
                 # Store the first error
@@ -408,7 +454,7 @@ def fixed_litellm_completions(**params):
                 and "api_key" not in params
             ):
                 print(
-                    "LiteLLM requires an API key. Trying again with a dummy API key. In the future, please set a dummy API key to prevent this message. (e.g `interpreter --api_key x` or `self.api_key = 'x'`)"
+                    "LiteLLM requires an API key. Trying again with a dummy API key. In the future, if this fixes it, please set a dummy API key to prevent this message. (e.g `interpreter --api_key x` or `self.api_key = 'x'`)"
                 )
                 # So, let's try one more time with a dummy API key:
                 params["api_key"] = "x"
