@@ -60,7 +60,7 @@ class AsyncInterpreter(OpenInterpreter):
         self.server = Server(self)
 
         # For the 01. This lets the OAI compatible server accumulate context before responding.
-        self.context_mode = True
+        self.context_mode = False
 
     async def input(self, chunk):
         """
@@ -723,7 +723,39 @@ def create_router(async_interpreter):
         temperature: Optional[float] = None
         stream: Optional[bool] = False
 
-    async def openai_compatible_generator():
+    async def openai_compatible_generator(run_code):
+        if run_code:
+            print("Running code.\n")
+            for i, chunk in enumerate(async_interpreter._respond_and_store()):
+                if "content" in chunk:
+                    print(chunk["content"], end="")  # Sorry! Shitty display for now
+                if "start" in chunk:
+                    print("\n")
+
+                output_content = None
+
+                if chunk["type"] == "message" and "content" in chunk:
+                    output_content = chunk["content"]
+                if chunk["type"] == "code" and "start" in chunk:
+                    output_content = "```" + chunk["format"] + "\n"
+                if chunk["type"] == "code" and "content" in chunk:
+                    output_content = chunk["content"]
+                if chunk["type"] == "code" and "end" in chunk:
+                    output_content = "\n```\n"
+
+                if output_content:
+                    await asyncio.sleep(0)
+                    output_chunk = {
+                        "id": i,
+                        "object": "chat.completion.chunk",
+                        "created": time.time(),
+                        "model": "open-interpreter",
+                        "choices": [{"delta": {"content": output_content}}],
+                    }
+                    yield f"data: {json.dumps(output_chunk)}\n\n"
+
+            return
+
         made_chunk = False
 
         for message in [
@@ -740,6 +772,22 @@ def create_router(async_interpreter):
                 await asyncio.sleep(0)  # Yield control to the event loop
                 made_chunk = True
 
+                if (
+                    chunk["type"] == "confirmation"
+                    and async_interpreter.auto_run == False
+                ):
+                    await asyncio.sleep(0)
+                    output_content = "Do you want to run this code?"
+                    output_chunk = {
+                        "id": i,
+                        "object": "chat.completion.chunk",
+                        "created": time.time(),
+                        "model": "open-interpreter",
+                        "choices": [{"delta": {"content": output_content}}],
+                    }
+                    yield f"data: {json.dumps(output_chunk)}\n\n"
+                    break
+
                 if async_interpreter.stop_event.is_set():
                     break
 
@@ -748,7 +796,11 @@ def create_router(async_interpreter):
                 if chunk["type"] == "message" and "content" in chunk:
                     output_content = chunk["content"]
                 if chunk["type"] == "code" and "start" in chunk:
-                    output_content = " "
+                    output_content = "```" + chunk["format"] + "\n"
+                if chunk["type"] == "code" and "content" in chunk:
+                    output_content = chunk["content"]
+                if chunk["type"] == "code" and "end" in chunk:
+                    output_content = "\n```\n"
 
                 if output_content:
                     await asyncio.sleep(0)
@@ -776,6 +828,9 @@ def create_router(async_interpreter):
 
         if last_message.content == "{STOP}":
             # Handle special STOP token
+            async_interpreter.stop_event.set()
+            time.sleep(5)
+            async_interpreter.stop_event.clear()
             return
 
         if last_message.content in ["{CONTEXT_MODE_ON}", "{REQUIRE_START_ON}"]:
@@ -786,7 +841,22 @@ def create_router(async_interpreter):
             async_interpreter.context_mode = False
             return
 
-        if type(last_message.content) == str:
+        if last_message.content == "{AUTO_RUN_ON}":
+            async_interpreter.auto_run = True
+            return
+
+        if last_message.content == "{AUTO_RUN_OFF}":
+            async_interpreter.auto_run = False
+            return
+
+        run_code = False
+        if (
+            async_interpreter.messages
+            and async_interpreter.messages[-1]["type"] == "code"
+            and last_message.content.lower().strip(".!?").strip() == "yes"
+        ):
+            run_code = True
+        elif type(last_message.content) == str:
             async_interpreter.messages.append(
                 {
                     "role": "user",
@@ -825,35 +895,36 @@ def create_router(async_interpreter):
                         }
                     )
 
-        if async_interpreter.context_mode:
-            # In context mode, we only respond if we recieved a {START} message
-            # Otherwise, we're just accumulating context
-            if last_message.content == "{START}":
-                if async_interpreter.messages[-1]["content"] == "{START}":
+        else:
+            if async_interpreter.context_mode:
+                # In context mode, we only respond if we recieved a {START} message
+                # Otherwise, we're just accumulating context
+                if last_message.content == "{START}":
+                    if async_interpreter.messages[-1]["content"] == "{START}":
+                        # Remove that {START} message that would have just been added
+                        async_interpreter.messages = async_interpreter.messages[:-1]
+                    last_start_time = time.time()
+                    if (
+                        async_interpreter.messages
+                        and async_interpreter.messages[-1].get("role") != "user"
+                    ):
+                        return
+                else:
+                    # Check if we're within 6 seconds of last_start_time
+                    current_time = time.time()
+                    if current_time - last_start_time <= 6:
+                        # Continue processing
+                        pass
+                    else:
+                        # More than 6 seconds have passed, so return
+                        return
+
+            else:
+                if last_message.content == "{START}":
+                    # This just sometimes happens I guess
                     # Remove that {START} message that would have just been added
                     async_interpreter.messages = async_interpreter.messages[:-1]
-                last_start_time = time.time()
-                if (
-                    async_interpreter.messages
-                    and async_interpreter.messages[-1].get("role") != "user"
-                ):
                     return
-            else:
-                # Check if we're within 6 seconds of last_start_time
-                current_time = time.time()
-                if current_time - last_start_time <= 6:
-                    # Continue processing
-                    pass
-                else:
-                    # More than 6 seconds have passed, so return
-                    return
-
-        else:
-            if last_message.content == "{START}":
-                # This just sometimes happens I guess
-                # Remove that {START} message that would have just been added
-                async_interpreter.messages = async_interpreter.messages[:-1]
-                return
 
         async_interpreter.stop_event.set()
         time.sleep(0.1)
@@ -861,7 +932,7 @@ def create_router(async_interpreter):
 
         if request.stream:
             return StreamingResponse(
-                openai_compatible_generator(), media_type="application/x-ndjson"
+                openai_compatible_generator(run_code), media_type="application/x-ndjson"
             )
         else:
             messages = async_interpreter.chat(message=".", stream=False, display=True)
@@ -904,8 +975,8 @@ class Server:
                 )
 
         self.app.include_router(router)
-        h = host or os.getenv("HOST", Server.DEFAULT_HOST)
-        p = port or int(os.getenv("PORT", Server.DEFAULT_PORT))
+        h = host or os.getenv("INTERPRETER_HOST", Server.DEFAULT_HOST)
+        p = port or int(os.getenv("INTERPRETER_PORT", Server.DEFAULT_PORT))
         self.config = uvicorn.Config(app=self.app, host=h, port=p)
         self.uvicorn_server = uvicorn.Server(self.config)
 
